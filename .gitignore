@@ -1,0 +1,8 @@
+.venv/
+*.swp
+__pycache__/
+*.pyc
+.python-version
+dist/
+build/
+*.egg-info/

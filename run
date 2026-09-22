@@ -1,0 +1,34 @@
+#!/usr/bin/env sh
+# Launch nbus-term, bootstrapping everything it needs.
+#
+# Requires only a POSIX shell + curl/wget. If `uv` (the Python project manager)
+# isn't installed, it's fetched into ~/.local/bin. uv then handles the Python
+# interpreter and the dependencies declared in pyproject.toml — nothing to
+# install by hand.
+set -e
+
+cd "$(dirname "$0")"
+
+if ! command -v uv >/dev/null 2>&1; then
+    # uv might already be installed but not on PATH yet (fresh install).
+    for d in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+        [ -x "$d/uv" ] && PATH="$d:$PATH"
+    done
+fi
+
+if ! command -v uv >/dev/null 2>&1; then
+    echo "uv not found — installing it (one-time)…" >&2
+    if command -v curl >/dev/null 2>&1; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- https://astral.sh/uv/install.sh | sh
+    else
+        echo "Need curl or wget to install uv. See https://docs.astral.sh/uv/" >&2
+        exit 1
+    fi
+    for d in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+        [ -x "$d/uv" ] && PATH="$d:$PATH"
+    done
+fi
+
+exec uv run --quiet nbus-term "$@"
