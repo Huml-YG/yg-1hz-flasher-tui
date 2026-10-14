@@ -33,9 +33,12 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
 
 import serial
+from serial.tools import list_ports
 
 # ----------------------------------------------------------------------------
 # Protocol layer  (no UI in here, so it can be unit-tested on its own)
@@ -44,6 +47,18 @@ import serial
 DEFAULT_BAUD = 300
 EOL = b"\r\n"
 RESP_PREFIX = b"RESP,"
+
+# Time to let the device finish booting before asserting DTR (see NbusDevice.open).
+# Bench-confirmed directly on this adapter: DTR and RTS both idle low through boot,
+# then DTR alone goes high once settled and communication can begin. Tune on the
+# bench if boot takes longer.
+BOOT_SETTLE_S = 2.0
+
+# Extra margin after flush() before dropping RTS (see NbusDevice._write). flush()
+# only guarantees the USB-serial bridge's own buffer is empty, not that the last
+# byte has finished shifting onto the wire - too short and the tail of every
+# frame gets clipped/corrupted. Tune on the bench if that still happens.
+RTS_DROP_MARGIN_S = 0.08
 
 
 def _extract_resp(buf: bytes) -> Optional[bytes]:
@@ -129,21 +144,38 @@ class NbusDevice:
         self.baud = baud
         self.timeout = timeout          # how long to wait for the reply, past the echo
         self.ser: Optional[serial.Serial] = None
+        self.on_line_change: Optional[Callable[[], None]] = None
+        """Fired after DTR/RTS is changed from inside this class (boot-time DTR,
+        or the per-write RTS pulse), so a UI can mirror the live state without
+        this class knowing anything about UIs. Not fired for direct `self.ser.dtr
+        = ...` pokes from outside (e.g. a caller's own bench-debug toggle)."""
 
     def open(self, probe: bool = True) -> None:
-        self.ser = serial.Serial(
-            self.port,
-            self.baud,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=0.2,  # per-read timeout; overall waits are bounded by callers
-        )
+        # Built unopened (port=None) so DTR/RTS can be set *before* the port is
+        # actually opened - pyserial defaults both high on open, which on this
+        # hardware resets the device. Boot with both low, then raise DTR once
+        # booted - confirmed on the bench to be needed for the NBUS adapter
+        # board to enable at all. RTS is handled separately, per write, by
+        # `_write()`: the adapter only drives the host's TX onto the bus while
+        # RTS is high, but leaving RTS high afterward blocks the device's own
+        # reply (classic RS485-style half-duplex direction control), so it's
+        # raised only for the duration of each transmission.
+        self.ser = serial.Serial()
+        self.ser.port = self.port
+        self.ser.baudrate = self.baud
+        self.ser.bytesize = serial.EIGHTBITS
+        self.ser.parity = serial.PARITY_NONE
+        self.ser.stopbits = serial.STOPBITS_ONE
+        self.ser.timeout = 0.2  # per-read timeout; overall waits are bounded by callers
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.open()
+        time.sleep(BOOT_SETTLE_S)
+        self._set_line("dtr", True)
         self.ser.reset_input_buffer()
         if probe:
             # spec: a newline must precede the first command
-            self.ser.write(EOL)
-            self.ser.flush()
+            self._write(EOL)
             self._read_exact(len(EOL), self._wire_time(len(EOL)) + 0.3)  # swallow its echo
 
     def close(self) -> None:
@@ -162,6 +194,28 @@ class NbusDevice:
     def _wire_time(self, nbytes: int) -> float:
         """Seconds to shift `nbytes` bytes at the current baud (~10 bits/byte)."""
         return nbytes * 10.0 / max(self.baud, 1)
+
+    def _set_line(self, name: str, value: bool) -> None:
+        """Set DTR/RTS and fire `on_line_change` so a UI can mirror it live."""
+        try:
+            setattr(self.ser, name, value)
+        except OSError:
+            pass  # pty / virtual port with no real modem-control lines (e.g. tests)
+        if self.on_line_change:
+            self.on_line_change()
+
+    def _write(self, data: bytes) -> None:
+        """Write a frame with RTS asserted only for the transmission itself.
+        `flush()` is `tcdrain()` on POSIX, but on a USB-serial bridge that only
+        guarantees the bridge's own buffer is empty - the last byte or two can
+        still be shifting out to the wire a few ms after it returns (seen on
+        the bench as the tail of the frame getting clipped/corrupted when RTS
+        dropped right on flush()'s return). RTS_DROP_MARGIN_S pads for that."""
+        self._set_line("rts", True)
+        self.ser.write(data)
+        self.ser.flush()
+        time.sleep(RTS_DROP_MARGIN_S)
+        self._set_line("rts", False)
 
     def _read_exact(self, n: int, timeout: float) -> bytes:
         """Read at most `n` bytes, stopping early on `timeout`. Used to consume
@@ -190,8 +244,7 @@ class NbusDevice:
         assert self.is_open, "port not open"
         self.ser.reset_input_buffer()
         frame = EOL + body + EOL
-        self.ser.write(frame)
-        self.ser.flush()
+        self._write(frame)
 
         # The echo has to shift out and loop back before the device can reply.
         budget = self._wire_time(len(frame)) + (self.timeout if expect_response else 1.0)
@@ -219,8 +272,7 @@ class NbusDevice:
         assert self.is_open, "port not open"
         self.ser.reset_input_buffer()
         frame = EOL + f"TEST,BAUD,{new_baud},".encode() + EOL
-        self.ser.write(frame)
-        self.ser.flush()                       # tcdrain: waits until physically sent
+        self._write(frame)                     # also drops RTS once physically sent
         # Consume exactly our echo (at the old rate) - never more, so a fast
         # reply waiting behind it survives the switch.
         self._read_exact(len(frame), self._wire_time(len(frame)) + 0.3)
@@ -300,6 +352,22 @@ def scan_bauds(port: str, bauds: list[int] = SCAN_BAUDS, listen_s: float = 1.2,
         if on_row:
             on_row(row)
     return rows
+
+
+def detect_ports() -> list[tuple[str, str]]:
+    """Currently connected serial ports as (device, description) pairs, e.g.
+    ('/dev/ttyUSB0', 'CP2102 USB to UART Bridge Controller'). Backs the port
+    picker; the port field itself stays a freely-editable Input for anything
+    this doesn't see (remote ports, devices that enumerate oddly, etc.)."""
+    return sorted((p.device, p.description) for p in list_ports.comports())
+
+
+def port_select_options() -> list[tuple[str, str]]:
+    """`detect_ports()` rendered as (label, value) pairs for `Select`."""
+    return [
+        (f"{dev}  ({desc})" if desc != "n/a" else dev, dev)
+        for dev, desc in detect_ports()
+    ]
 
 
 def hexdump(data: bytes, width: int = 16) -> str:
@@ -479,12 +547,22 @@ CMD_BY_KEY = {c.key: c for c in COMMANDS}
 # TUI
 # ----------------------------------------------------------------------------
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
-    Button, Footer, Header, Input, Label, ListItem, ListView, RichLog, Static,
+    Button, Footer, Header, Input, Label, ListItem, ListView, RichLog, Select, Static,
 )
+
+
+class PortSelect(Select[str]):
+    """A `Select` that re-scans connected serial ports each time it's opened,
+    so newly plugged-in devices show up without restarting the app."""
+
+    def action_show_overlay(self) -> None:
+        self.set_options(port_select_options())
+        super().action_show_overlay()
 
 
 class NbusApp(App):
@@ -496,10 +574,16 @@ class NbusApp(App):
     }
     #conn-bar Input { width: 22; }
     #conn-bar #baud { width: 9; }
+    #conn-bar #port-select { width: 20; }
     #conn-bar Button { margin: 0 1; }
     #status { width: 1fr; content-align: right middle; padding: 0 1; }
     #status.ok  { color: $success; }
     #status.bad { color: $error; }
+
+    #line-bar { height: auto; padding: 0 1 1 1; align-vertical: middle; }
+    #line-bar Label { padding: 0 1; color: $text-muted; }
+    #line-bar Button { margin: 0 1; min-width: 12; }
+    #line-bar Button.asserted { color: $success; }
 
     #body { height: 1fr; }
     #cmd-pane  { width: 44; border-right: solid $panel; }
@@ -515,7 +599,11 @@ class NbusApp(App):
     Label.section { text-style: bold; padding: 0 1; }
     """
 
-    BINDINGS = [("q", "quit", "Quit"), ("ctrl+l", "clear_log", "Clear log")]
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("ctrl+l", "clear_log", "Clear log"),
+        ("ctrl+s", "save_log", "Save log"),
+    ]
 
     def __init__(self, port: str = "/dev/ttyUSB0", baud: int = DEFAULT_BAUD):
         super().__init__()
@@ -523,16 +611,22 @@ class NbusApp(App):
         self._start_baud = str(baud)
         self.device: Optional[NbusDevice] = None
         self.current: Optional[Command] = None
+        self._transcript: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Horizontal(id="conn-bar"):
             yield Input(value=self._start_port, id="port", placeholder="/dev/ttyUSB0")
+            yield PortSelect(port_select_options(), prompt="Detected ports", id="port-select")
             yield Input(value=self._start_baud, id="baud", placeholder="baud")
             yield Button("Connect", id="connect", variant="success")
             yield Button("Monitor", id="monitor")
             yield Button("Scan", id="scan")
             yield Static("\u25cf disconnected", id="status", classes="bad")
+        with Horizontal(id="line-bar"):
+            yield Label("Modem lines (bench debug):")
+            yield Button("DTR: -", id="dtr-btn", disabled=True)
+            yield Button("RTS: -", id="rts-btn", disabled=True)
         with Horizontal(id="body"):
             with Vertical(id="cmd-pane"):
                 yield Label("Commands", classes="section")
@@ -553,6 +647,7 @@ class NbusApp(App):
 
     def _log(self, msg: str) -> None:
         self.query_one("#log", RichLog).write(msg)
+        self._transcript.append(Text.from_markup(msg).plain)
 
     def _set_status(self, connected: bool, text: str) -> None:
         s = self.query_one("#status", Static)
@@ -560,8 +655,37 @@ class NbusApp(App):
         s.set_classes(["ok"] if connected else ["bad"])
         self.query_one("#send", Button).disabled = not (connected and self.current)
 
+    def _refresh_line_buttons(self) -> None:
+        self._sync_line_buttons(self.device)
+
+    def _sync_line_buttons(self, dev: Optional[NbusDevice]) -> None:
+        """Sync the DTR/RTS bench-debug buttons with a device's actual state.
+        Takes an explicit device (rather than always reading self.device) so
+        NbusDevice.on_line_change can drive this live, from inside open(),
+        before the connect worker has assigned self.device."""
+        connected = dev is not None and dev.is_open
+        for name in ("dtr", "rts"):
+            btn = self.query_one(f"#{name}-btn", Button)
+            btn.disabled = not connected
+            if connected:
+                state = getattr(dev.ser, name)
+                btn.label = f"{name.upper()}: {state}"
+                btn.set_class(state, "asserted")
+            else:
+                btn.label = f"{name.upper()}: -"
+                btn.set_class(False, "asserted")
+
     def action_clear_log(self) -> None:
         self.query_one("#log", RichLog).clear()
+        self._transcript.clear()
+
+    def action_save_log(self) -> None:
+        """Dump the full transcript to a text file - a reliable way to get it
+        out of the terminal even when mouse-drag selection / OSC52 clipboard
+        copy isn't available (e.g. over some SSH/tmux setups)."""
+        path = Path.cwd() / f"nbus-transcript-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        path.write_text("\n".join(self._transcript) + "\n")
+        self._log(f"[dim]transcript saved to {path}[/]")
 
     # --- command selection --------------------------------------------------
 
@@ -582,6 +706,14 @@ class NbusApp(App):
         connected = self.device is not None and self.device.is_open
         self.query_one("#send", Button).disabled = not connected
 
+    # --- port picker ---------------------------------------------------------
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "port-select" or event.select.is_blank():
+            return
+        self.query_one("#port", Input).value = str(event.value)
+        event.select.clear()
+
     # --- buttons ------------------------------------------------------------
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -593,6 +725,25 @@ class NbusApp(App):
             self._do_monitor()
         elif event.button.id == "scan":
             self._do_scan(self.query_one("#port", Input).value.strip())
+        elif event.button.id in ("dtr-btn", "rts-btn"):
+            self._toggle_line(event.button.id.removesuffix("-btn"))
+
+    def _toggle_line(self, name: str) -> None:
+        """Flip DTR or RTS on the live port - bench debug for boards whose
+        NBUS adapter gates the bus on these lines (see README)."""
+        if self.device is None or not self.device.is_open:
+            return
+        current = getattr(self.device.ser, name)
+        try:
+            setattr(self.device.ser, name, not current)
+        except OSError as e:
+            # pyserial records the new state before the ioctl can fail, so the
+            # line value may already have changed even though the physical
+            # write didn't - refresh regardless so the button reflects reality.
+            self._log(f"[red]{name.upper()} toggle failed:[/] {e}")
+        else:
+            self._log(f"[dim]{name.upper()} -> {not current}[/]")
+        self._refresh_line_buttons()
 
     def _connect_pressed(self) -> None:
         if self.device and self.device.is_open:
@@ -600,6 +751,7 @@ class NbusApp(App):
             self.device = None
             self._set_status(False, "disconnected")
             self.query_one("#connect", Button).label = "Connect"
+            self._refresh_line_buttons()
             self._log("[dim]disconnected[/]")
             return
         port = self.query_one("#port", Input).value.strip()
@@ -625,6 +777,9 @@ class NbusApp(App):
         self.call_from_thread(self._log, f"[dim]opening {port} @ {baud} 8N1 ...[/]")
         try:
             dev = NbusDevice(port, baud)
+            # Wired before open() so even the boot-time DTR raise and the
+            # probe's RTS pulse (both inside open()) are reflected live.
+            dev.on_line_change = lambda: self.call_from_thread(self._sync_line_buttons, dev)
             dev.open()
         except Exception as e:  # noqa: BLE001 - surface any open error to the user
             self.call_from_thread(self._log, f"[red]open failed:[/] {e}")
@@ -632,6 +787,7 @@ class NbusApp(App):
             return
         self.device = dev
         self.call_from_thread(self.query_one("#connect", Button).__setattr__, "label", "Disconnect")
+        self.call_from_thread(self._refresh_line_buttons)
         reply = dev.send(b"TEST,MODEM,")
         if reply.ok:
             self.call_from_thread(self._log, f"[green]connected[/] - {parse_modem(reply.resp)}")
@@ -677,6 +833,7 @@ class NbusApp(App):
         except Exception as e:  # noqa: BLE001
             self.call_from_thread(self._log, f"[red]send error:[/] {e}")
             return
+        self.call_from_thread(self._refresh_line_buttons)  # RTS drops after each write
 
         # Echo check first - single-wire bus, so this isolates a bad wire from a
         # mute device. (change_baud discards the echo, so skip it there.)

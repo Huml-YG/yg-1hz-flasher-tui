@@ -39,7 +39,8 @@ sudo usermod -aG dialout "$USER"   # then log out and back in
 
 ### Layout
 
-- **Connection bar** (top): port, baud, Connect/Disconnect, **Monitor**, **Scan**, status indicator.
+- **Connection bar** (top): port (free-text, with a dropdown next to it listing currently connected serial ports - picking one fills the field; the dropdown re-scans each time it's opened), baud, Connect/Disconnect, **Monitor**, **Scan**, status indicator.
+- **Modem lines bar** (below the connection bar): `DTR` / `RTS` buttons showing the live state of each line and toggling it on click. Disabled while disconnected. This is bench-debug tooling for exploring line behaviour by hand; note that `NbusDevice` manages RTS itself around every write (see below), so the RTS button mostly reflects that automatic toggling rather than something you need to drive manually during normal use - it's most useful between commands, or for probing a *different* adapter board whose line requirements aren't known yet.
 - **Commands** (left): the list of supported commands.
 - **Parameters** (right): inputs for the selected command, pre-filled with sensible defaults. Send is here.
 - **Transcript** (bottom): `»` shows the raw bytes sent (control chars escaped), `«` shows the response and its decoded meaning.
@@ -47,6 +48,9 @@ sudo usermod -aG dialout "$USER"   # then log out and back in
 
 - `q` — quit
 - `Ctrl+L` — clear the transcript
+- `Ctrl+S` — save the full transcript (plain text, markup stripped) to `nbus-transcript-<timestamp>.txt` in the current directory
+
+You can also click-and-drag in the transcript to select text and copy it with `Ctrl+C` (Textual's built-in terminal text selection, copied via OSC52) - this only grabs what's currently visible/scrolled-to on screen, though. `Ctrl+S` dumps the entire session regardless of scroll position, and doesn't depend on your terminal/multiplexer supporting OSC52 clipboard passthrough.
 ## Supported commands
 
 | Command | What it does | Response |
@@ -92,6 +96,7 @@ These are choices the source spec left open. If you touch them, see the maintena
 - **Command framing.** The spec's examples show a *leading* `CRLF` and a trailing comma (`\r\nTEST,MODEM,`) but no trailing `CRLF`, which is ambiguous about whether a command completes on the trailing comma or on the next end-of-line. `nbus_term` frames every command with a `CRLF` on **both** sides. This works under either interpretation and preserves the trailing comma. If your firmware strictly completes on the comma and objects to the extra trailing `CRLF`, change this in `NbusDevice.send`.
 - **`TEST,BAUD`.** The device replies at the *new* rate. The tool sends the request, waits for it (and its echo) to clear the wire at the old rate, discards that echo, retunes its own port, then reads `RESP,OK,` at the new baud — the session stays live across the change. The echo is dropped here, so the echo verdict isn't shown for this command.
 - **Leading newline.** The spec requires a newline before the first command; the tool sends one on connect and also prefixes one to every command, so this is handled. If a first command ever silently does nothing on real hardware, a missing leading newline is the usual suspect — but this tool already covers it.
+- **DTR/RTS.** `NbusDevice.open()` builds the port unopened and drives DTR and RTS low *before* calling `.open()`, because pyserial otherwise defaults both high at open time, and on this hardware that resets the device. It then waits `BOOT_SETTLE_S` (2 s) and raises DTR, which stays high for the life of the connection - bench-confirmed directly on the "ESP32 FLASHER NBUS ADAPTER" board: both lines sit low through boot, then DTR alone goes high and communication can proceed, with RTS left low throughout boot. RTS is different: the board only drives the host's TX onto the NBUS line while RTS is high, but leaving RTS high afterward blocks the device's own reply from getting through (classic RS485-style half-duplex direction control) - so RTS is raised only for the duration of each write and dropped immediately after, handled by `NbusDevice._write()` (used by `open`'s probe, `send`, and `change_baud` - every write goes through it). `flush()` is `tcdrain()` on POSIX, so the drop happens the instant the bytes are physically out, not on a guessed delay. Every call to `open()` pays the `BOOT_SETTLE_S` delay, including once per rate in **Scan**, so a full sweep is slower than before but no longer resets the device out from under itself on each reopen. If `BOOT_SETTLE_S` is wrong for your hardware's actual boot time, adjust the constant near the top of the file.
 - **NBUS is a single wire.** The temperature port is a half-duplex bus (one data line, plus 12 V and ground). Everything sent echoes back on the same wire, so `NbusDevice.send` reads that echo first, treats only a post-echo `RESP,`-prefixed line as a reply, and surfaces a missing echo as a distinct "bus fault". There is no TX/RX pair — a wiring fault appears as a missing or mangled echo, not a one-way link. Reply timeouts are derived from the baud rate (frame shift-out + shift-back time) rather than fixed, so 300 baud doesn't spuriously time out.
 ### Testing
 
